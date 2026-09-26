@@ -1,0 +1,275 @@
+# Copyright (C) 2020 Dremio
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Unifies main + PR workflow.
+#
+# The unified CI workflow consists of 2 "stages":
+# - Checks - test, intTest, NesQuEIT, etc
+# - Finalize - a "success" dummy job for PRs + a "save to github-cache" job for push-to-main
+#
+# Utilizes the Gradle build cache for all stages. The updated build cache
+# of the jobs in the checks stage are saved as artifacts (with the minimum
+# retention period). The updated build cache is pushed back to GigHub's
+# cache when the checks have successfully finished.
+
+name: CI build
+
+on:
+  workflow_dispatch:
+
+# For the main branch: let all CI runs complete, one after the other. This has a couple advantages:
+# * Site deployments happen in commit-order
+# * Saved Gradle cache are persisted in commit-order
+# * (Potentially) more GH runners available for PRs
+concurrency:
+  # PRs: 1 CI run concurrently / older ones are cancelled
+  # main branch: 1 CI run concurrently / no cancellation
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  determine-jobs:
+    name: CI Determine jobs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      # Each "conditional" job has a mapped output here, also a "non-PR" case and a "PR" case
+      # with label and globs (at the end of the script).
+      docker: ${{ steps.determine.outputs.docker }}
+      nesqueit: ${{ steps.determine.outputs.nesqueit }}
+    steps:
+    - name: install minimatch
+      shell: bash
+      run: npm install minimatch@"^7.4.3"
+    - name: Determine conditional jobs to run
+      id: determine
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3   # v9
+      with:
+        script: |
+          const {Minimatch} = require("minimatch");
+
+          async function getChangedFiles(pull_request) {
+            const listFilesOptions = github.rest.pulls.listFiles.endpoint.merge({
+              owner: pull_request.base.repo.owner.login,
+              repo: pull_request.base.repo.name,
+              pull_number: pull_request.number,
+            });
+            return github.paginate(listFilesOptions).then(resp => resp.map(f => f.filename))
+          }
+
+          function isMatch(changedFile, matchers) {
+            for (const matcher of matchers) {
+              if (matcher.match(changedFile)) {
+                core.info("Match found for changed file " + changedFile);
+                return true;
+              }
+            }
+            core.info("No changed file matched the globs");
+            return false;
+          }
+
+          function filesMatchAnyGlob(changedFiles, globs) {
+            const matchers = globs.map(g => new Minimatch(g));
+            for (const changedFile of changedFiles) {
+              if (isMatch(changedFile, matchers)) {
+                return true;
+              }
+            }
+            return false;
+          }
+
+          function checkLabelOrGlobs(pr, changedFiles, labelName, globs) {
+            core.info("Checking for " + labelName);
+
+            // If the PR has the given label, then let the conditional job run.
+            for (const label of pr.labels) {
+              if (label.name === labelName) {
+                core.info("PR has label " + labelName);
+                return true;
+              }
+            }
+
+            // For pull request, check the list of changed files against the given globs.
+            // Let the conditional job run, if any of the globs matches and of the changed files.
+            core.info("Checking changed files against globs " + globs);
+            return filesMatchAnyGlob(changedFiles, globs);
+          }
+
+          ///////////////////////////////////////////////////////////////////////////////////////
+          // "Non PR" case:
+          // Behavior of the conditional jobs when the event that triggered the workflow is not
+          // for a pull request (usually a push-to-main).
+          //
+          if (!context.payload || !context.payload.pull_request) {
+            core.info("Not a pull-request, enabling all jobs.");
+
+            // Yield default values for all event payload types, except pull_request
+            core.setOutput('docker', true);
+            core.setOutput('nesqueit', false); // handled in a scheduled job
+            return true;
+          }
+
+          ///////////////////////////////////////////////////////////////////////////////////////
+          // "PR" case:
+          // Determine the whether the conditional jobs shall run, based on a label name, which
+          // has been manually added, or, if the label is not present, based on some globs to
+          // check.
+
+          const pr = context.payload.pull_request
+          core.info("pull-request #" + pr.number);
+
+          // Retrieves the full list of changed files for the PR.
+          const changedFiles = await getChangedFiles(pr);
+
+          core.startGroup('PR job check / Docker');
+          core.setOutput('docker', checkLabelOrGlobs(pr, changedFiles,
+            'pr-docker',
+            ['gradle/wrapper/**', 'tools/dockerbuild/**', 'helm/**', '.github/**']));
+          core.endGroup();
+
+          core.startGroup('PR job check / NesQuEIT');
+          core.setOutput('nesqueit', checkLabelOrGlobs(pr, changedFiles,
+            'pr-integrations',
+            ['gradle/wrapper/**', 'integrations/**', 'api/**', '.github/**']));
+          core.endGroup();
+
+  nesqueit:
+    name: CI NesQuEIT [ubuntu-24.04--x64]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    needs:
+    - determine-jobs
+    # Only run NesQuEIT tests for PRs, if requested. This job can easily run for 30+ minutes.
+    if: github.event_name == 'pull_request' && 
+      needs.determine-jobs.outputs.nesqueit == 'true'
+    env:
+      NESSIE_DIR: included-builds/nessie
+      NESSIE_PATCH_REPOSITORY: 'snazy/nessie'
+      NESSIE_PATCH_BRANCH: 'integ-bump/iceberg'
+      NESQUEIT_REPOSITORY: projectnessie/query-engine-integration-tests
+      NESQUEIT_BRANCH: main
+      ICEBERG_DIR: included-builds/iceberg
+      ICEBERG_MAIN_REPOSITORY: apache/iceberg
+      ICEBERG_MAIN_BRANCH: main
+      ICEBERG_PATCH_REPOSITORY: snazy/iceberg
+      ICEBERG_PATCH_BRANCH: iceberg-nesqueit
+      SPARK_LOCAL_IP: localhost
+    steps:
+    - name: Prepare Git
+      run: |
+        git config --global user.email "integrations-testing@projectnessie.org"
+        git config --global user.name "Integrations Testing [Bot]"
+
+    - name: Checkout NeQuEIT repo
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
+      with:
+        repository: ${{env.NESQUEIT_REPOSITORY}}
+        ref: ${{env.NESQUEIT_BRANCH}}
+
+    - name: Free disk space
+      uses: ./.github/actions/free-disk-space
+
+    - name: Setup runner
+      uses: ./.github/actions/setup-runner
+      with:
+        more-memory: 'true'
+
+    - name: Checkout and patch Nessie PR
+      uses: ./.github/actions/patch-git
+      with:
+        name: Nessie
+        local-dir: ${{env.NESSIE_DIR}}
+        main-repository: ${{ env.GITHUB_REPOSITORY }}
+        patch-repository: ${{env.NESSIE_PATCH_REPOSITORY}}
+        patch-branch: ${{env.NESSIE_PATCH_BRANCH}}
+        work-branch: nessie-integration-patched
+
+    - name: Checkout and patch Iceberg
+      uses: ./.github/actions/patch-git
+      with:
+        name: Nessie
+        local-dir: ${{env.ICEBERG_DIR}}
+        main-repository: ${{env.ICEBERG_MAIN_REPOSITORY}}
+        main-branch: ${{env.ICEBERG_MAIN_BRANCH}}
+        patch-repository: ${{env.ICEBERG_PATCH_REPOSITORY}}
+        patch-branch: ${{env.ICEBERG_PATCH_BRANCH}}
+        work-branch: iceberg-integration-patched
+
+    - name: Gradle 9 prereq
+        # Gradle 9 requires a project's directory to exist, even if it's empty.
+      run: mkdir "${{env.ICEBERG_DIR}}/bom"
+
+      # Setup Gradle properties, heap requirements are for the "Integration test w/ Nessie".
+    - name: Setup gradle.properties
+      run: |
+        mkdir -p ~/.gradle
+        echo "org.gradle.jvmargs=-Xms2g -Xmx6g -XX:MaxMetaspaceSize=768m -Dfile.encoding=UTF-8" >> ~/.gradle/gradle.properties
+        echo "org.gradle.vfs.watch=false" >> ~/.gradle/gradle.properties
+
+    - name: Setup JDK
+      uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6   # v6
+      with:
+        distribution: 'temurin'
+          # Java 17 or 21 required for Nessie build, Java 17 required for Iceberg build, Java 11 required for Flink & Presto
+        java-version: |
+          11
+          17
+          21
+
+    - name: Setup Gradle
+      uses: gradle/actions/setup-gradle@0723195856401067f7a2779048b490ace7a47d7c   # v5
+      with:
+        cache-read-only: true
+        validate-wrappers: false
+
+    - name: Iceberg Nessie test
+      run: ./gradlew :iceberg:iceberg-nessie:test --scan
+
+    - name: Nessie Spark 3.4 / 2.13 Extensions test
+      run: |
+        ./gradlew \
+          -DscalaVersion=2.13 \
+          :nessie:nessie-iceberg:nessie-spark-extensions-3.4_2.13:test \
+          :nessie:nessie-iceberg:nessie-spark-extensions-3.4_2.13:intTest \
+          --continue \
+          --scan
+
+    - name: Nessie Spark 3.5 / 2.13 Extensions test
+      run: |
+        ./gradlew \
+          -DscalaVersion=2.13 \
+          :nessie:nessie-iceberg:nessie-spark-extensions-3.5_2.13:test \
+          :nessie:nessie-iceberg:nessie-spark-extensions-3.5_2.13:intTest \
+          --continue \
+          --scan
+
+      #- name: Publish Nessie + Iceberg to local Maven repo
+      #  run: ./gradlew publishLocal --scan
+      #
+      #- name: Gather locally published versions
+      #  run: |
+      #    NESSIE_VERSION="$(cat included-builds/nessie/version.txt)"
+      #    ICEBERG_VERSION="$(cat included-builds/iceberg/build/iceberg-build.properties | grep '^git.build.version=' | cut -d= -f2)"
+      #    echo "NESSIE_VERSION=${NESSIE_VERSION}" >> ${GITHUB_ENV}
+      #    echo "ICEBERG_VERSION=${ICEBERG_VERSION}" >> ${GITHUB_ENV}
+      #    cat <<! >> $GITHUB_STEP_SUMMARY
+      #    ## Published versions
+      #    | Published Nessie version | Published Iceberg version |
+      #    | ------------------------ | ------------------------- |
+      #    | ${NESSIE_VERSION}        | ${ICEBERG_VERSION}        |
+      #    !
+
+    - name: Tools & Integrations tests
+      run: ./gradlew intTest --continue --scan
+
